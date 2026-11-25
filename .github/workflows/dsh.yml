@@ -1,0 +1,162 @@
+name: Build dsh image
+
+# 单文件版：仓库里只放这一个文件，Dockerfile 与启动脚本由工作流自己写出。
+# 手机端：新建仓库 -> Add file -> Create new file -> 路径填 .github/workflows/dsh.yml -> 粘贴本文件 -> Commit
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "留空 = 取 npm 上官方 latest"
+        required: false
+        default: ""
+      force:
+        description: "已存在也强制重建"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "17 3 * * *"
+
+concurrency:
+  group: dsh-build
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  DOCKERFILE: |
+    FROM node:24-bookworm-slim
+    RUN apt-get update \
+        && apt-get install -y --no-install-recommends git ca-certificates curl ripgrep procps tini \
+        && rm -rf /var/lib/apt/lists/*
+    ARG DSH_VERSION=0.2.2-rc.5
+    RUN npm install -g @deepseek-ai/dsh@${DSH_VERSION} pnpm@10 --registry=https://registry.npmjs.org \
+        && npm cache clean --force
+    ENV DSH_HOME=/data HOME=/data NODE_ENV=production TZ=Asia/Shanghai NPM_CONFIG_UPDATE_NOTIFIER=false
+    COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+    COPY healthcheck.sh /usr/local/bin/healthcheck.sh
+    RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/healthcheck.sh && mkdir -p /data /workspace
+    WORKDIR /workspace
+    EXPOSE 3080
+    ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
+  ENTRYPOINT_SH: |
+    #!/bin/bash
+    set -e
+    PORT="${DSH_PORT:-3080}"
+    if [ -n "$DSH_HOST" ]; then
+      HOST_IP="$DSH_HOST"
+    else
+      HOST_IP="$(node -e '
+    const os=require("os");const ifs=os.networkInterfaces();
+    const pick=(l)=>(l||[]).find(i=>i.family==="IPv4"&&!i.internal);
+    const r=pick(ifs.eth0)||pick(Object.values(ifs).flat());
+    process.stdout.write(r?r.address:"");
+    ' 2>/dev/null || true)"
+    fi
+    if [ -z "$HOST_IP" ]; then
+      HOST_IP="$(hostname -i 2>/dev/null | tr " " "\n" | grep -E "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$" | grep -v "^127\." | head -1 || true)"
+    fi
+    case "$HOST_IP" in
+      "" | 127.* | 0.0.0.0)
+        echo "[dsh] 未取到可用容器网卡地址，请设置 DSH_HOST=<容器IP>" >&2
+        exit 1;;
+    esac
+    ARGS=(--profile web --host "$HOST_IP" --port "$PORT" --no-open)
+    if [ -n "$DSH_TRUSTED_HOST" ]; then
+      ARGS+=(--trusted-host)
+      for h in $DSH_TRUSTED_HOST; do ARGS+=("$h"); done
+    fi
+    echo "[dsh] listen=${HOST_IP}:${PORT} home=${DSH_HOME} trusted=${DSH_TRUSTED_HOST:-none}"
+    exec dsh "${ARGS[@]}"
+  HEALTHCHECK_SH: |
+    #!/bin/bash
+    set -e
+    PORT="${DSH_PORT:-3080}"
+    if [ -n "$DSH_HOST" ]; then
+      IP="$DSH_HOST"
+    else
+      IP="$(node -e '
+    const os=require("os");const ifs=os.networkInterfaces();
+    const pick=(l)=>(l||[]).find(i=>i.family==="IPv4"&&!i.internal);
+    const r=pick(ifs.eth0)||pick(Object.values(ifs).flat());
+    process.stdout.write(r?r.address:"");
+    ' 2>/dev/null || true)"
+    fi
+    [ -n "$IP" ] || exit 1
+    curl -fsS --max-time 4 "http://${IP}:${PORT}/" >/dev/null
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version and image name
+        id: meta
+        run: |
+          OWNER=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          NAME="ghcr.io/${OWNER}/dsh"
+          if [ -n "${{ inputs.version }}" ]; then
+            VER="${{ inputs.version }}"
+          else
+            VER=$(npm view @deepseek-ai/dsh dist-tags.latest)
+          fi
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Skip if image already exists
+        id: gate
+        run: |
+          if docker manifest inspect "${{ steps.meta.outputs.name }}:${{ steps.meta.outputs.version }}" >/dev/null 2>&1 \
+             && [ "${{ inputs.force }}" != "true" ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "该版本镜像已存在，跳过构建"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Write build files
+        if: steps.gate.outputs.build == 'true'
+        run: |
+          printf '%s\n' "$DOCKERFILE" > Dockerfile
+          printf '%s\n' "$ENTRYPOINT_SH" > entrypoint.sh
+          printf '%s\n' "$HEALTHCHECK_SH" > healthcheck.sh
+          chmod +x entrypoint.sh healthcheck.sh
+          bash -n entrypoint.sh
+          bash -n healthcheck.sh
+          echo "--- Dockerfile ---"; head -4 Dockerfile
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.gate.outputs.build == 'true'
+
+      - uses: docker/build-push-action@v6
+        if: steps.gate.outputs.build == 'true'
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            DSH_VERSION=${{ steps.meta.outputs.version }}
+          tags: |
+            ${{ steps.meta.outputs.name }}:${{ steps.meta.outputs.version }}
+            ${{ steps.meta.outputs.name }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+
+      - name: Summary
+        run: |
+          {
+            echo "### dsh 构建结果"
+            echo "- 版本: ${{ steps.meta.outputs.version }}"
+            echo "- 本次是否构建: ${{ steps.gate.outputs.build }}"
+            echo "- 镜像: ${{ steps.meta.outputs.name }}:${{ steps.meta.outputs.version }}"
+          } >> "$GITHUB_STEP_SUMMARY"
